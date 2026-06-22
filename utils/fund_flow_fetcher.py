@@ -9,7 +9,10 @@ import time
 from utils.base_fetcher import DataFetcher, FetcherFactory
 
 # 导入速率限制器
-from utils.stock_data_fetcher import _tushare_limiter
+try:
+    from utils.stock_data_fetcher import _tushare_limiter
+except ImportError:
+    _tushare_limiter = None
 
 # 配置日志
 logger = logging.getLogger(__name__)
@@ -30,19 +33,9 @@ class FundFlowFetcher(DataFetcher):
     
     # ==================== 个股资金流向 ====================
     
-    def _fetch_daily_stock_moneyflow(self, start_date: str, end_date: str, pro, stock_codes: Optional[list] = None) -> Optional[pd.DataFrame]:
+    def _fetch_daily_stock_moneyflow(self, start_date: str, end_date: str, pro=None, stock_codes: Optional[list] = None) -> Optional[pd.DataFrame]:
         """
         逐日采集个股资金流向数据
-        按日期逐日调用接口，确保获取完整的30天数据
-        
-        参数：
-            start_date: 开始日期，格式 YYYYMMDD
-            end_date: 结束日期，格式 YYYYMMDD
-            pro: Tushare API 实例（可选，如果为None则自己创建）
-            stock_codes: 股票代码列表（可选，如果提供则只获取这些股票的数据）
-        
-        返回：
-            合并后的个股资金流向数据 DataFrame
         """
         logger.info(f"开始逐日采集个股资金流向数据: {start_date} 到 {end_date}")
         if stock_codes:
@@ -53,27 +46,32 @@ class FundFlowFetcher(DataFetcher):
         try:
             # 如果pro为None，创建Tushare API实例
             if pro is None:
-                import tushare as ts
-                import json
-                
-                # 获取Tushare token配置
-                tushare_config_path = 'config/tushare_config.json'
-                with open(tushare_config_path, 'r', encoding='utf-8') as f:
-                    tushare_config = json.load(f)
-                token = tushare_config.get('token') or tushare_config.get('api_key')
-                
-                if not token:
-                    logger.error("未找到Tushare token配置")
+                try:
+                    import tushare as ts
+                    import json
+                    
+                    tushare_config_path = 'config/tushare_config.json'
+                    with open(tushare_config_path, 'r', encoding='utf-8') as f:
+                        tushare_config = json.load(f)
+                    token = tushare_config.get('token') or tushare_config.get('api_key')
+                    
+                    if not token:
+                        logger.warning("未找到Tushare token配置，跳过个股资金流向采集")
+                        return None
+                    
+                    pro = ts.pro_api(token)
+                except ImportError:
+                    logger.warning("tushare未安装，跳过个股资金流向采集")
                     return None
-                
-                # 创建Tushare API实例
-                pro = ts.pro_api(token)
+                except Exception as e:
+                    logger.warning(f"初始化Tushare失败，跳过个股资金流向采集: {e}")
+                    return None
             
             # 将日期字符串转换为 datetime 对象
             start_dt = datetime.strptime(start_date, '%Y%m%d')
             end_dt = datetime.strptime(end_date, '%Y%m%d')
             
-            # 如果提供了 stock_codes，转换为 Tushare 格式（添加 .SH/.SZ 后缀）
+            # 如果提供了 stock_codes，转换为 Tushare 格式
             ts_codes = None
             if stock_codes:
                 ts_codes = set()
@@ -91,14 +89,12 @@ class FundFlowFetcher(DataFetcher):
                 current_date_str = current_dt.strftime('%Y%m%d')
                 
                 try:
-                    # 速率限制
-                    _tushare_limiter.wait_if_needed()
+                    if _tushare_limiter:
+                        _tushare_limiter.wait_if_needed()
                     
-                    # 调用接口获取该日期的数据
                     df_daily = pro.moneyflow(trade_date=current_date_str)
                     
                     if df_daily is not None and len(df_daily) > 0:
-                        # 如果提供了 stock_codes，过滤数据
                         if ts_codes:
                             df_daily = df_daily[df_daily['ts_code'].isin(ts_codes)]
                         
@@ -106,17 +102,14 @@ class FundFlowFetcher(DataFetcher):
                             all_data.append(df_daily)
                             logger.debug(f"获取 {current_date_str} 的个股资金流向数据: {len(df_daily)} 条")
                     
-                    # 添加延迟，避免触发速率限制
                     time.sleep(0.3)
                     
                 except Exception as e:
                     logger.warning(f"获取 {current_date_str} 的个股资金流向数据失败: {e}")
                 
-                # 移动到下一天
                 current_dt += timedelta(days=1)
                 day_count += 1
             
-            # 合并所有数据
             if all_data:
                 df_merged = pd.concat(all_data, ignore_index=True)
                 logger.info(f"逐日采集完成，共采集 {day_count} 天，获取 {len(df_merged)} 条个股资金流向数据")
@@ -131,47 +124,37 @@ class FundFlowFetcher(DataFetcher):
     
     # ==================== 行业资金流向 ====================
     
-    def _fetch_daily_industry_moneyflow(self, start_date: str, end_date: str, pro) -> Optional[pd.DataFrame]:
+    def _fetch_daily_industry_moneyflow(self, start_date: str, end_date: str, pro=None) -> Optional[pd.DataFrame]:
         """
         逐日采集行业资金流向数据
-        按日期逐日调用接口，确保获取完整的30天数据
-        
-        参数：
-            start_date: 开始日期，格式 YYYYMMDD
-            end_date: 结束日期，格式 YYYYMMDD
-            pro: Tushare API 实例（可选，如果为None则自己创建）
-        
-        返回：
-            合并后的行业资金流向数据 DataFrame
         """
         logger.info(f"开始逐日采集行业资金流向数据: {start_date} 到 {end_date}")
         
         all_data = []
         
         try:
-            # 如果pro为None，创建Tushare API实例
             if pro is None:
-                import tushare as ts
-                import json
-                
-                # 获取Tushare token配置
-                tushare_config_path = 'config/tushare_config.json'
-                with open(tushare_config_path, 'r', encoding='utf-8') as f:
-                    tushare_config = json.load(f)
-                token = tushare_config.get('token') or tushare_config.get('api_key')
-                
-                if not token:
-                    logger.error("未找到Tushare token配置")
+                try:
+                    import tushare as ts
+                    import json
+                    tushare_config_path = 'config/tushare_config.json'
+                    with open(tushare_config_path, 'r', encoding='utf-8') as f:
+                        tushare_config = json.load(f)
+                    token = tushare_config.get('token') or tushare_config.get('api_key')
+                    if not token:
+                        logger.warning("未找到Tushare token配置，跳过行业资金流向采集")
+                        return None
+                    pro = ts.pro_api(token)
+                except ImportError:
+                    logger.warning("tushare未安装，跳过行业资金流向采集")
                     return None
-                
-                # 创建Tushare API实例
-                pro = ts.pro_api(token)
+                except Exception as e:
+                    logger.warning(f"初始化Tushare失败，跳过行业资金流向采集: {e}")
+                    return None
             
-            # 将日期字符串转换为 datetime 对象
             start_dt = datetime.strptime(start_date, '%Y%m%d')
             end_dt = datetime.strptime(end_date, '%Y%m%d')
             
-            # 逐日采集
             current_dt = start_dt
             day_count = 0
             
@@ -179,27 +162,18 @@ class FundFlowFetcher(DataFetcher):
                 current_date_str = current_dt.strftime('%Y%m%d')
                 
                 try:
-                    # 速率限制
-                    _tushare_limiter.wait_if_needed()
-                    
-                    # 调用接口获取该日期的数据
+                    if _tushare_limiter:
+                        _tushare_limiter.wait_if_needed()
                     df_daily = pro.moneyflow_ind_ths(trade_date=current_date_str)
-                    
                     if df_daily is not None and len(df_daily) > 0:
                         all_data.append(df_daily)
-                        logger.debug(f"获取 {current_date_str} 的行业资金流向数据: {len(df_daily)} 条")
-                    
-                    # 添加延迟，避免触发速率限制
                     time.sleep(0.3)
-                    
                 except Exception as e:
                     logger.warning(f"获取 {current_date_str} 的行业资金流向数据失败: {e}")
                 
-                # 移动到下一天
                 current_dt += timedelta(days=1)
                 day_count += 1
             
-            # 合并所有数据
             if all_data:
                 df_merged = pd.concat(all_data, ignore_index=True)
                 logger.info(f"逐日采集完成，共采集 {day_count} 天，获取 {len(df_merged)} 条行业资金流向数据")
@@ -214,75 +188,54 @@ class FundFlowFetcher(DataFetcher):
     
     # ==================== 板块资金流向 ====================
     
-    def _fetch_daily_sector_moneyflow(self, start_date: str, end_date: str, pro) -> Optional[pd.DataFrame]:
+    def _fetch_daily_sector_moneyflow(self, start_date: str, end_date: str, pro=None) -> Optional[pd.DataFrame]:
         """
         逐日采集板块资金流向数据
-        按日期逐日调用接口，确保获取完整的30天数据
-        
-        参数：
-            start_date: 开始日期，格式 YYYYMMDD
-            end_date: 结束日期，格式 YYYYMMDD
-            pro: Tushare API 实例（可选，如果为None则自己创建）
-        
-        返回：
-            合并后的板块资金流向数据 DataFrame
         """
         logger.info(f"开始逐日采集板块资金流向数据: {start_date} 到 {end_date}")
         
         all_data = []
         
         try:
-            # 如果pro为None，创建Tushare API实例
             if pro is None:
-                import tushare as ts
-                import json
-                
-                # 获取Tushare token配置
-                tushare_config_path = 'config/tushare_config.json'
-                with open(tushare_config_path, 'r', encoding='utf-8') as f:
-                    tushare_config = json.load(f)
-                token = tushare_config.get('token') or tushare_config.get('api_key')
-                
-                if not token:
-                    logger.error("未找到Tushare token配置")
+                try:
+                    import tushare as ts
+                    import json
+                    tushare_config_path = 'config/tushare_config.json'
+                    with open(tushare_config_path, 'r', encoding='utf-8') as f:
+                        tushare_config = json.load(f)
+                    token = tushare_config.get('token') or tushare_config.get('api_key')
+                    if not token:
+                        logger.warning("未找到Tushare token配置，跳过板块资金流向采集")
+                        return None
+                    pro = ts.pro_api(token)
+                except ImportError:
+                    logger.warning("tushare未安装，跳过板块资金流向采集")
                     return None
-                
-                # 创建Tushare API实例
-                pro = ts.pro_api(token)
+                except Exception as e:
+                    logger.warning(f"初始化Tushare失败，跳过板块资金流向采集: {e}")
+                    return None
             
-            # 将日期字符串转换为 datetime 对象
             start_dt = datetime.strptime(start_date, '%Y%m%d')
             end_dt = datetime.strptime(end_date, '%Y%m%d')
             
-            # 逐日采集
             current_dt = start_dt
             day_count = 0
             
             while current_dt <= end_dt:
                 current_date_str = current_dt.strftime('%Y%m%d')
-                
                 try:
-                    # 速率限制
-                    _tushare_limiter.wait_if_needed()
-                    
-                    # 调用接口获取该日期的数据
+                    if _tushare_limiter:
+                        _tushare_limiter.wait_if_needed()
                     df_daily = pro.moneyflow_cnt_ths(trade_date=current_date_str)
-                    
                     if df_daily is not None and len(df_daily) > 0:
                         all_data.append(df_daily)
-                        logger.debug(f"获取 {current_date_str} 的板块资金流向数据: {len(df_daily)} 条")
-                    
-                    # 添加延迟，避免触发速率限制
                     time.sleep(0.3)
-                    
                 except Exception as e:
                     logger.warning(f"获取 {current_date_str} 的板块资金流向数据失败: {e}")
-                
-                # 移动到下一天
                 current_dt += timedelta(days=1)
                 day_count += 1
             
-            # 合并所有数据
             if all_data:
                 df_merged = pd.concat(all_data, ignore_index=True)
                 logger.info(f"逐日采集完成，共采集 {day_count} 天，获取 {len(df_merged)} 条板块资金流向数据")
@@ -298,40 +251,28 @@ class FundFlowFetcher(DataFetcher):
     # ==================== 行业资金流向数据库操作 ====================
     
     def _fetch_industry_fund_flow(self, trade_date: str) -> Optional[pd.DataFrame]:
-        """
-        获取行业资金流向数据
-        
-        参数：
-            trade_date: 交易日期，格式 YYYYMMDD
-        
-        返回：
-            包含行业资金流向数据的 DataFrame，如果失败返回 None
-        """
+        """获取行业资金流向数据"""
         try:
             import tushare as ts
             import json
             
-            # 获取Tushare token配置
             tushare_config_path = 'config/tushare_config.json'
             with open(tushare_config_path, 'r', encoding='utf-8') as f:
                 tushare_config = json.load(f)
             token = tushare_config.get('token') or tushare_config.get('api_key')
             
             if not token:
-                logger.error("未找到Tushare token配置")
                 return None
             
-            # 创建Tushare API实例
             pro = ts.pro_api(token)
-            
-            # 速率限制
-            _tushare_limiter.wait_if_needed()
-            
-            # 使用 moneyflow_ind_ths 接口获取行业资金流向数据
+            if _tushare_limiter:
+                _tushare_limiter.wait_if_needed()
             df_flow = pro.moneyflow_ind_ths(trade_date=trade_date)
-            
             return df_flow
         
+        except ImportError:
+            logger.warning("tushare未安装，跳过行业资金流向")
+            return None
         except Exception as e:
             logger.error(f"获取行业资金流向数据失败: {e}")
             return None
@@ -432,40 +373,24 @@ class FundFlowFetcher(DataFetcher):
     # ==================== 板块资金流向数据库操作 ====================
     
     def _fetch_sector_fund_flow(self, trade_date: str) -> Optional[pd.DataFrame]:
-        """
-        获取板块资金流向数据
-        
-        参数：
-            trade_date: 交易日期，格式 YYYYMMDD
-        
-        返回：
-            包含板块资金流向数据的 DataFrame，如果失败返回 None
-        """
+        """获取板块资金流向数据"""
         try:
             import tushare as ts
             import json
-            
-            # 获取Tushare token配置
             tushare_config_path = 'config/tushare_config.json'
             with open(tushare_config_path, 'r', encoding='utf-8') as f:
                 tushare_config = json.load(f)
             token = tushare_config.get('token') or tushare_config.get('api_key')
-            
             if not token:
-                logger.error("未找到Tushare token配置")
                 return None
-            
-            # 创建Tushare API实例
             pro = ts.pro_api(token)
-            
-            # 速率限制
-            _tushare_limiter.wait_if_needed()
-            
-            # 使用 moneyflow_cnt_ths 接口获取板块资金流向数据
+            if _tushare_limiter:
+                _tushare_limiter.wait_if_needed()
             df_flow = pro.moneyflow_cnt_ths(trade_date=trade_date)
-            
             return df_flow
-        
+        except ImportError:
+            logger.warning("tushare未安装，跳过板块资金流向")
+            return None
         except Exception as e:
             logger.error(f"获取板块资金流向数据失败: {e}")
             return None

@@ -17,15 +17,9 @@ export function searchSelectionHistory() {
     
     const strategyName = strategyFilter?.value?.trim() || '';
     const startDate = startDateInput?.value || '';
-    let endDate = endDateInput?.value || '';
+    const endDate = endDateInput?.value || '';
     
     console.log('筛选条件:', { strategyName, startDate, endDate });
-    
-    // 如果结束日期为空，默认设置为当天
-    if (!endDate) {
-        const today = new Date();
-        endDate = today.toISOString().split('T')[0];
-    }
     
     // 调用API（不传递股票代码）
     fetchSelectionHistory(strategyName, startDate, endDate, 1);
@@ -109,8 +103,12 @@ export function renderHistoryTable(data) {
         }
         
         const row = document.createElement('tr');
-        // 使用选入当日收盘价作为选入价格显示
         const selectionPrice = record.selection_day_price || record.selection_price || 0;
+        const priceDiff = record.price_diff || 0;
+        const priceDiffPct = record.price_diff_pct || 0;
+        const diffColor = priceDiff > 0 ? '#16a34a' : priceDiff < 0 ? '#dc2626' : '#6b7280';
+        const diffSign = priceDiff > 0 ? '+' : '';
+        const pctSign = priceDiffPct > 0 ? '+' : '';
         row.innerHTML = `
             <td><span style="background: #dbeafe; color: #0c4a6e; padding: 4px 8px; border-radius: 4px; font-size: 12px; font-weight: 600;">${escapeHtml(record.strategy_name)}</span></td>
             <td><a href="javascript:void(0)" onclick="viewStockDetail('${escapeHtml(record.stock_code)}')" class="stock-link" style="color: #2563eb; text-decoration: none; cursor: pointer; font-weight: 600;">${escapeHtml(record.stock_code)}</a></td>
@@ -118,6 +116,8 @@ export function renderHistoryTable(data) {
             <td>${formatDate(record.selection_date)}</td>
             <td>¥${formatPrice(selectionPrice)}</td>
             <td>¥${formatPrice(record.current_price)}</td>
+            <td style="color: ${diffColor}; font-weight: 600;">${diffSign}¥${formatPrice(priceDiff)}</td>
+            <td style="color: ${diffColor}; font-weight: 600;">${pctSign}${formatPrice(priceDiffPct)}%</td>
             <td>
                 <div style="font-size: 12px;">
                     <div>最高: ¥${formatPrice(record.highest_price)}</div>
@@ -208,13 +208,7 @@ export function renderHistoryPagination(total, currentPage, limit) {
 export function goToHistoryPage(page) {
     const strategyName = document.getElementById('history-strategy-filter')?.value.trim() || '';
     const startDate = document.getElementById('history-start-date')?.value || '';
-    let endDate = document.getElementById('history-end-date')?.value || '';
-    
-    // 如果结束日期为空，默认设置为当天
-    if (!endDate) {
-        const today = new Date();
-        endDate = today.toISOString().split('T')[0];
-    }
+    const endDate = document.getElementById('history-end-date')?.value || '';
     
     fetchSelectionHistory(strategyName, startDate, endDate, page);
 }

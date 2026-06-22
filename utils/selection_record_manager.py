@@ -408,7 +408,7 @@ class SelectionRecordManager:
     def _get_stock_industry(self, stock_code: str) -> str:
         """
         获取股票行业信息
-        优先从stock_basic表获取，如果没有则尝试从industry_fetcher获取
+        优先从stock_basic表获取，如果没有则返回空字符串
         
         参数：
             stock_code: 股票代码
@@ -426,23 +426,6 @@ class SelectionRecordManager:
             
             if industry:
                 return industry
-            
-            # 如果stock_basic表中没有，尝试使用industry_fetcher获取
-            try:
-                from utils.industry_fetcher import IndustryFetcher
-                from utils.cache_manager import CacheManager
-                
-                cache_manager = CacheManager()
-                fetcher = IndustryFetcher(self.db_manager, cache_manager)
-                
-                # 使用fetch_with_retry获取行业信息
-                industry_data = fetcher.fetch_with_retry(stock_code=stock_code)
-                if industry_data and 'industry_name' in industry_data:
-                    industry_name = industry_data['industry_name']
-                    logger.debug(f"从industry_fetcher获取到股票 {stock_code} 的行业: {industry_name}")
-                    return industry_name
-            except Exception as e:
-                logger.debug(f"从industry_fetcher获取行业信息失败: {str(e)}")
             
             return ''
         except Exception as e:
@@ -610,109 +593,100 @@ class SelectionRecordManager:
             if row and row[0]:
                 total = row[0]
             
-            # 转换为字典列表并计算价格指标
+            # 第一步：查询所有候选记录（多取一些以便筛选后仍够limit条）
+            fetch_limit = limit * 3 if strategy_name_filter else limit
+            query_sql = f"""
+            SELECT stock_code, stock_name, selection_date, selection_price, 
+                   industry, sector, selection_time, strategy_count
+            FROM stock_selection_record 
+            WHERE {where_sql}
+            ORDER BY selection_date DESC, strategy_count DESC, selection_time DESC
+            """
+            cursor = self.db_manager.execute_with_retry(query_sql, params)
+            all_rows = [dict(row) for row in cursor.fetchall()]
+            
+            # 第二步：按 stock_code + selection_date 分组
+            grouped = {}
+            for row in all_rows:
+                key = (row['stock_code'], row['selection_date'])
+                if key not in grouped:
+                    grouped[key] = row
+            
+            candidate_list = list(grouped.values())
+            
+            # 第三步：批量获取所有股票的实时数据（一次HTTP请求）
+            stock_codes = list(set(r['stock_code'] for r in candidate_list))
+            realtime_data = self._batch_fetch_realtime_data(stock_codes)
+            
+            # 第四步：逐条处理（策略筛选 + 性能计算）
             data = []
             filtered_total = 0
             
-            # 计算偏移量
-            offset = (page - 1) * limit
-            current_offset = offset
-            
-            while len(data) < limit:
-                # 构建查询SQL，使用strategy_count字段
-                query_sql = f"""
-                SELECT DISTINCT stock_code, stock_name, selection_date, MIN(selection_price) as selection_price, 
-                       MIN(industry) as industry, MIN(sector) as sector, 
-                       MIN(selection_time) as selection_time, 
-                       MAX(strategy_count) as strategy_count
+            for record in candidate_list:
+                stock_code = record['stock_code']
+                selection_date = record['selection_date']
+                
+                # 获取该股票在该日期的所有策略
+                strategies_sql = """
+                SELECT strategy_name 
                 FROM stock_selection_record 
-                WHERE {where_sql}
-                GROUP BY stock_code, selection_date
-                ORDER BY selection_date DESC, strategy_count DESC, selection_time DESC
-                LIMIT ? OFFSET ?
+                WHERE stock_code = ? AND selection_date = ? AND is_active = 1
                 """
+                strategies_cursor = self.db_manager.execute_with_retry(strategies_sql, (stock_code, selection_date))
+                strategies = [row[0] for row in strategies_cursor.fetchall()]
                 
-                # 执行查询
-                cursor = self.db_manager.execute_with_retry(query_sql, params + [limit * 2, current_offset])
-                batch_rows = [dict(row) for row in cursor.fetchall()]
+                # 如果有策略名称筛选，检查是否包含该策略
+                if strategy_name_filter:
+                    filter_text = strategy_name_filter
+                    filter_text_no_strategy = filter_text.replace('策略', '')
+                    
+                    matched = False
+                    for strategy in strategies:
+                        if filter_text in strategy:
+                            matched = True
+                            break
+                        strategy_no_strategy = strategy.replace('策略', '')
+                        if filter_text_no_strategy in strategy_no_strategy:
+                            matched = True
+                            break
+                    
+                    if not matched:
+                        continue
                 
-                if not batch_rows:
-                    break
+                # 使用预获取的实时数据计算价格指标（无网络请求）
+                performance = self._calculate_performance_batch(
+                    stock_code, record['selection_price'],
+                    selection_date, realtime_data.get(stock_code)
+                )
                 
-                current_offset += len(batch_rows)
+                # 合并价格指标和策略信息
+                record.update(performance)
+                record['strategy_name'] = "，".join(strategies)
+                record['strategies'] = strategies
                 
-                for record in batch_rows:
-                    stock_code = record['stock_code']
-                    selection_date = record['selection_date']
-                    
-                    # 获取该股票在该日期的所有策略
-                    strategies_sql = """
-                    SELECT strategy_name 
-                    FROM stock_selection_record 
-                    WHERE stock_code = ? AND selection_date = ? AND is_active = 1
-                    """
-                    strategies_cursor = self.db_manager.execute_with_retry(strategies_sql, (stock_code, selection_date))
-                    strategies = [row[0] for row in strategies_cursor.fetchall()]
-                    
-                    # 如果有策略名称筛选，检查是否包含该策略
-                    if strategy_name_filter:
-                        # 检查是否有策略名称包含筛选条件（兼容有无"策略"二字的情况）
-                        filter_text = strategy_name_filter
-                        # 移除"策略"二字进行比较
-                        filter_text_no_strategy = filter_text.replace('策略', '')
-                        
-                        matched = False
-                        for strategy in strategies:
-                            # 检查原始策略名称是否包含筛选条件
-                            if filter_text in strategy:
-                                matched = True
-                                break
-                            # 检查移除"策略"二字后的策略名称是否包含筛选条件
-                            strategy_no_strategy = strategy.replace('策略', '')
-                            if filter_text_no_strategy in strategy_no_strategy:
-                                matched = True
-                                break
-                        
-                        if not matched:
-                            continue
-                    
-                    # 实时计算价格指标
-                    performance = self.calculate_performance(
-                        stock_code,
-                        record['selection_price'],
-                        selection_date
-                    )
-                    
-                    # 合并价格指标和策略信息
-                    record.update(performance)
-                    record['strategy_name'] = "，".join(strategies)  # 用中文逗号连接策略名称
-                    record['strategies'] = strategies  # 添加策略列表
-                    data.append(record)
-                    filtered_total += 1
-                    
-                    if len(data) >= limit:
-                        break
+                # 计算价差和百分比价差
+                sp = record.get('selection_price', 0)
+                cp = record.get('current_price', 0)
+                record['price_diff'] = round(cp - sp, 2)
+                record['price_diff_pct'] = round(((cp - sp) / sp) * 100, 2) if sp != 0 else 0.0
+                
+                data.append(record)
+                filtered_total += 1
             
-            # 计算实际的总记录数（如果有筛选）
+            # 按百分比价差降序排序（默认）
+            data.sort(key=lambda x: x.get('price_diff_pct', 0), reverse=True)
+            
+            # 分页截取
+            start_idx = (page - 1) * limit
+            data = data[start_idx:start_idx + limit]
+            
+            # 重新计算筛选后的总数
             if strategy_name_filter:
-                # 重新查询符合筛选条件的总记录数
-                filtered_count_sql = f"""
-                SELECT COUNT(*) as total 
-                FROM (
-                    SELECT DISTINCT stock_code, selection_date 
-                    FROM stock_selection_record 
-                    WHERE {where_sql}
-                ) as distinct_records
-                """
-                cursor = self.db_manager.execute_with_retry(filtered_count_sql, params)
-                row = cursor.fetchone()
-                if row and row[0]:
-                    total = row[0]
-            else:
-                # 使用之前查询的总记录数
-                pass
+                filtered_total = len([r for r in candidate_list 
+                    if self._match_strategy_filter(r['stock_code'], r['selection_date'], strategy_name_filter)])
+                total = filtered_total
             
-            logger.info(f"查询选股历史 - 总数: {total}, 筛选后: {filtered_total}, 页码: {page}, 每页: {limit}")
+            logger.info(f"查询选股历史 - 总数: {total}, 筛选后: {len(data)}, 页码: {page}, 每页: {limit}")
             
             return {
                 'success': True,
@@ -727,6 +701,84 @@ class SelectionRecordManager:
             return {
                 'success': False,
                 'error': str(e)
+            }
+    
+    def _match_strategy_filter(self, stock_code: str, selection_date, filter_text: str) -> bool:
+        """检查股票是否匹配策略名称筛选"""
+        try:
+            strategies_sql = """
+            SELECT strategy_name 
+            FROM stock_selection_record 
+            WHERE stock_code = ? AND selection_date = ? AND is_active = 1
+            """
+            cursor = self.db_manager.execute_with_retry(strategies_sql, (stock_code, selection_date))
+            strategies = [row[0] for row in cursor.fetchall()]
+            
+            filter_text_no_strategy = filter_text.replace('策略', '')
+            for strategy in strategies:
+                if filter_text in strategy:
+                    return True
+                if filter_text_no_strategy in strategy.replace('策略', ''):
+                    return True
+            return False
+        except Exception:
+            return False
+    
+    def _calculate_performance_batch(self, stock_code: str, selection_price: float,
+                                     selection_date, realtime: Optional[Dict] = None) -> Dict:
+        """
+        使用预获取的实时数据计算表现指标（无网络请求，无CSV读取）
+        
+        参数：
+            stock_code: 股票代码
+            selection_price: 选入价格（来自数据库，已是选入日收盘价）
+            selection_date: 选入日期
+            realtime: 预获取的实时数据 {'price': float, 'high': float, 'low': float}
+        """
+        try:
+            # 当前价格
+            current_price = realtime['price'] if realtime and realtime.get('price', 0) > 0 else selection_price
+            
+            # 最高最低价：使用实时数据 + 选入价格兜底
+            highest_price = selection_price
+            lowest_price = selection_price
+            
+            if realtime:
+                today_high = realtime.get('high', 0)
+                today_low = realtime.get('low', 0)
+                if today_high > 0:
+                    highest_price = today_high
+                if today_low > 0:
+                    lowest_price = today_low
+            
+            # 确保最高价至少等于当前价格和选入价格
+            highest_price = max(highest_price, current_price, selection_price)
+            
+            # 计算收益率（基于选入价格）
+            return_rate = ((current_price - selection_price) / selection_price) * 100 if selection_price != 0 else 0.0
+            max_gain = ((highest_price - selection_price) / selection_price) * 100 if selection_price != 0 else 0.0
+            max_loss = ((lowest_price - selection_price) / selection_price) * 100 if selection_price != 0 else 0.0
+            
+            return {
+                'selection_day_price': round(selection_price, 2),
+                'current_price': round(current_price, 2),
+                'highest_price': round(highest_price, 2),
+                'lowest_price': round(lowest_price, 2),
+                'return_rate': round(return_rate, 2),
+                'max_gain': round(max_gain, 2),
+                'max_loss': round(max_loss, 2)
+            }
+        
+        except Exception as e:
+            logger.error(f"计算表现指标失败: {str(e)}")
+            return {
+                'selection_day_price': round(selection_price, 2),
+                'current_price': round(selection_price, 2),
+                'highest_price': round(selection_price, 2),
+                'lowest_price': round(selection_price, 2),
+                'return_rate': 0.0,
+                'max_gain': 0.0,
+                'max_loss': 0.0
             }
     
     def check_duplicate(self, stock_code: str, selection_date) -> Dict:
@@ -1215,14 +1267,90 @@ class SelectionRecordManager:
                 return df.iloc[-1]['close']
             return 0.0
 
+    def _batch_fetch_realtime_data(self, stock_codes: List[str]) -> Dict[str, Dict[str, float]]:
+        """
+        批量获取股票实时数据（腾讯财经接口）
+
+        一次HTTP请求获取所有股票的实时价格、最高价、最低价，
+        替代逐只股票逐个请求的方式，大幅减少网络延迟。
+
+        参数：
+            stock_codes: 股票代码列表
+
+        返回：
+            {stock_code: {'price': float, 'high': float, 'low': float}}
+        """
+        import requests
+
+        if not stock_codes:
+            return {}
+
+        result = {}
+
+        try:
+            # 构建批量查询代码
+            query_codes = []
+            for code in stock_codes:
+                if code.startswith('6') or code.startswith('8'):
+                    query_codes.append(f"sh{code}")
+                else:
+                    query_codes.append(f"sz{code}")
+
+            query_str = ','.join(query_codes)
+            url = f"https://qt.gtimg.cn/q={query_str}"
+            resp = requests.get(url, timeout=15, headers={
+                'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'
+            })
+            resp.encoding = 'gbk'
+
+            if resp.status_code == 200:
+                text = resp.text.strip()
+                # 腾讯接口多股票返回时，每只股票以v_sh/sz开头的行分隔
+                for line in text.split('\n'):
+                    line = line.strip()
+                    if '~' not in line:
+                        continue
+
+                    parts = line.split('~')
+                    if len(parts) < 35:
+                        continue
+
+                    # 提取股票代码（parts[2] 是股票代码）
+                    raw_code = parts[2] if len(parts) > 2 else ''
+                    if not raw_code or raw_code not in stock_codes:
+                        # 从v_sh/sz行名中提取代码
+                        for code in stock_codes:
+                            prefix = f"sh{code}" if code.startswith('6') or code.startswith('8') else f"sz{code}"
+                            if prefix in line:
+                                raw_code = code
+                                break
+                        if raw_code not in stock_codes:
+                            continue
+
+                    try:
+                        price = float(parts[3]) if parts[3] else 0
+                        high = float(parts[33]) if parts[33] else 0
+                        low = float(parts[34]) if parts[34] else 0
+
+                        if price > 0:
+                            result[raw_code] = {
+                                'price': price,
+                                'high': high,
+                                'low': low,
+                            }
+                    except (ValueError, IndexError):
+                        continue
+
+                logger.info(f"批量获取实时数据成功: {len(result)}/{len(stock_codes)} 只股票")
+
+        except Exception as e:
+            logger.warning(f"批量获取实时数据失败: {str(e)}")
+
+        return result
+
     def _fetch_realtime_price(self, stock_code: str) -> float:
         """
         通过腾讯财经接口获取股票最新价格
-
-        该接口在任何时段都返回最新有效价格：
-        - 交易中：实时价格
-        - 收盘后：当日收盘价
-        - 非交易日/开盘前：前一个交易日收盘价
 
         参数：
             stock_code: 股票代码（6位数字）
@@ -1233,30 +1361,24 @@ class SelectionRecordManager:
         import requests
 
         try:
-            # 构建腾讯财经查询代码
             if stock_code.startswith('6') or stock_code.startswith('8'):
                 query_code = f"sh{stock_code}"
             else:
                 query_code = f"sz{stock_code}"
 
-            # 调用腾讯财经接口
             url = f"https://qt.gtimg.cn/q={query_code}"
             resp = requests.get(url, timeout=10, headers={
                 'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'
             })
-
-            # 设置正确的字符编码
             resp.encoding = 'gbk'
 
             if resp.status_code == 200:
                 text = resp.text.strip()
                 if '~' in text:
                     parts = text.split('~')
-                    # parts[3] 是当前价格（实时价/收盘价）
                     if len(parts) >= 4:
                         price = float(parts[3])
                         if price > 0:
-                            logger.debug(f"获取最新价格成功: {stock_code} = ¥{price:.2f}")
                             return price
 
             return None

@@ -176,7 +176,10 @@ class MarketTemperature:
                 )
                 if df is not None and not df.empty:
                     return len(df) > 0
-            return False
+            
+            # 降级：简单周末判断
+            dt = datetime.strptime(trade_date, '%Y%m%d')
+            return dt.weekday() < 5  # 0-4 为周一到周五
         except Exception as e:
             logger.warning(f"检查交易日失败: {e}")
             return False

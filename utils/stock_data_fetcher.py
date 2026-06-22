@@ -827,8 +827,6 @@ class StockDataFetcher:
                     end_date = datetime.now().strftime('%Y%m%d')
                     start_date = (datetime.now() - timedelta(days=days)).strftime('%Y%m%d')
 
-                    # 使用 pro.bar 接口获取前复权数据
-                    # asset='E' 股票, freq='D' 日线, adj='qfq' 前复权
                     df = pro.bar(
                         ts_code=ts_code,
                         start_date=start_date,
@@ -844,6 +842,8 @@ class StockDataFetcher:
                         df = df.sort_values('date', ascending=False)
                         logger.debug(f"Tushare 获取 {len(df)} 条更新数据（前复权）")
                         return df
+            except ImportError:
+                logger.debug("tushare未安装，跳过Tushare降级")
             except Exception as e:
                 logger.debug(f"Tushare 获取失败: {e}")
 
@@ -855,21 +855,9 @@ class StockDataFetcher:
 
     def get_stock_market_cap(self, max_retries=3) -> dict:
         """
-        从 Tushare daily_basic 接口批量获取股票市值信息
+        批量获取股票市值信息
         
-        参数：
-            max_retries: 最大重试次数
-        
-        返回：
-            {code: market_cap} 字典，market_cap 单位为亿元
-        
-        说明：
-            - 调用 Tushare 的 daily_basic 接口（一次性获取所有股票）
-            - 提取 ts_code 和 total_mv 字段
-            - 转换格式：code = ts_code.split('.')[0]
-            - 单位转换：market_cap = total_mv / 10000（万元转亿元）
-            - 如果获取失败，返回空字典
-            - 使用批量处理，避免逐个查询
+        优先使用 Tushare daily_basic，失败则降级使用 akshare。
         """
         logger.info("开始批量获取股票市值信息...")
         
@@ -881,7 +869,6 @@ class StockDataFetcher:
                 import tushare as ts
                 import json
                 
-                # 读取 Tushare token
                 tushare_token = None
                 try:
                     with open('config/tushare_config.json', 'r', encoding='utf-8') as f:
@@ -892,46 +879,60 @@ class StockDataFetcher:
                 
                 if not tushare_token:
                     logger.warning("未找到 Tushare token，跳过 Tushare 方法")
-                    return {}
+                    break
                 
-                # 初始化 Tushare Pro API
                 pro = ts.pro_api(tushare_token)
-                
-                # 调用 daily_basic 接口获取所有股票的市值信息
-                # daily_basic 接口返回所有股票的每日基本面指标
                 df = pro.daily_basic(fields='ts_code,total_mv')
                 
                 if df is not None and not df.empty:
-                    # 构建 {code: market_cap} 字典
                     market_caps = {}
-                    
                     for _, row in df.iterrows():
                         try:
-                            # 提取股票代码（去掉交易所后缀）
                             code = str(row['ts_code']).split('.')[0]
-                            
-                            # 提取总市值（单位：万元）
                             total_mv = float(row['total_mv']) if pd.notna(row['total_mv']) else 0
-                            
-                            # 转换为亿元
                             market_cap = total_mv / 10000
-                            
                             market_caps[code] = market_cap
-                        
                         except Exception as e:
-                            logger.debug(f"处理市值数据失败: {e}")
                             continue
                     
                     if market_caps:
-                        logger.info(f"✓ 成功获取 {len(market_caps)} 只股票的市值信息")
+                        logger.info(f"成功获取 {len(market_caps)} 只股票的市值信息(Tushare)")
                         return market_caps
                     else:
                         logger.warning("daily_basic 返回空数据")
                         return {}
             
+            except ImportError:
+                logger.warning("tushare未安装，跳过Tushare市值获取")
+                break
             except Exception as e:
                 logger.debug(f"Tushare daily_basic 失败: {e}")
                 time.sleep(1)
+        
+        # 降级：使用 akshare 获取市值信息
+        try:
+            logger.info("尝试使用 akshare 获取市值信息...")
+            import akshare as ak
+            
+            df = ak.stock_zh_a_spot_em()
+            if df is not None and not df.empty:
+                market_caps = {}
+                for _, row in df.iterrows():
+                    try:
+                        code = str(row.get('代码', ''))
+                        total_mv = float(row.get('总市值', 0)) if pd.notna(row.get('总市值', 0)) else 0
+                        # akshare 返回的总市值单位是元，转换为亿元
+                        market_cap = total_mv / 1e8
+                        if code and market_cap > 0:
+                            market_caps[code] = market_cap
+                    except Exception:
+                        continue
+                
+                if market_caps:
+                    logger.info(f"成功获取 {len(market_caps)} 只股票的市值信息(akshare)")
+                    return market_caps
+        except Exception as e:
+            logger.warning(f"akshare获取市值信息也失败: {e}")
         
         logger.warning("获取市值信息失败，返回空字典")
         return {}

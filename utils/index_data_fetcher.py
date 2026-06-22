@@ -1,7 +1,6 @@
 """
 指数数据获取模块 - 获取中证1000指数历史数据并计算收益率
 """
-import tushare as ts
 import pandas as pd
 import numpy as np
 import logging
@@ -68,13 +67,30 @@ class IndexDataFetcher:
             # 使用tushare获取中证1000指数数据
             logger.info(f"获取中证1000指数数据: {start_date} ~ {end_date}")
             
-            # 初始化tushare
-            pro = ts.pro_api()
+            try:
+                import tushare as ts
+                pro = ts.pro_api()
+                df = pro.index_daily(ts_code=f'{self.index_code}.SH', 
+                                    start_date=start_date, 
+                                    end_date=end_date)
+            except (ImportError, Exception) as e:
+                logger.warning(f"Tushare获取指数数据失败，尝试akshare: {e}")
+                df = None
             
-            # tushare指数数据接口
-            df = pro.index_daily(ts_code=f'{self.index_code}.SH', 
-                                start_date=start_date, 
-                                end_date=end_date)
+            # 降级：使用akshare获取
+            if df is None or df.empty:
+                try:
+                    import akshare as ak
+                    # akshare 中证1000指数代码为 sh000852
+                    df = ak.stock_zh_index_daily(symbol=f"sh{self.index_code}")
+                    if df is not None and not df.empty:
+                        df['date'] = pd.to_datetime(df['date'])
+                        df = df[(df['date'] >= pd.to_datetime(start_date)) & (df['date'] <= pd.to_datetime(end_date))]
+                        df = df.rename(columns={'close': 'close', 'open': 'open', 'high': 'high', 'low': 'low', 'volume': 'volume'})
+                        df['change_pct'] = df['close'].pct_change() * 100
+                except Exception as e2:
+                    logger.warning(f"akshare获取指数数据也失败: {e2}")
+                    df = None
             
             if df is None or df.empty:
                 logger.error(f"获取中证1000指数数据失败: 数据为空")
