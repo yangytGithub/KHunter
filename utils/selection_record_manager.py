@@ -573,6 +573,14 @@ class SelectionRecordManager:
                 where_clauses.append("stock_code = ?")
                 params.append(filters['stock_code'])
             
+            # 剔除创业板（300/301开头）
+            if filters.get('exclude_chinext'):
+                where_clauses.append("stock_code NOT LIKE '300%' AND stock_code NOT LIKE '301%'")
+            
+            # 剔除科创板（688开头）
+            if filters.get('exclude_star'):
+                where_clauses.append("stock_code NOT LIKE '688%'")
+            
             where_sql = " AND ".join(where_clauses)
             
             # 策略名称筛选需要特殊处理，因为我们需要先分组再筛选
@@ -605,14 +613,38 @@ class SelectionRecordManager:
             cursor = self.db_manager.execute_with_retry(query_sql, params)
             all_rows = [dict(row) for row in cursor.fetchall()]
             
-            # 第二步：按 stock_code + selection_date 分组
+            # 第二步：按 stock_code 去重（保留最新的一条记录）
             grouped = {}
             for row in all_rows:
-                key = (row['stock_code'], row['selection_date'])
-                if key not in grouped:
-                    grouped[key] = row
+                stock_code = row['stock_code']
+                if stock_code not in grouped:
+                    grouped[stock_code] = row
             
             candidate_list = list(grouped.values())
+            
+            # 批量查询选股日当天的涨跌幅（从stock_kline获取open/close）
+            daily_change_map = {}
+            try:
+                kline_params = []
+                kline_conditions = []
+                for r in candidate_list:
+                    kline_params.extend([r['stock_code'], r['selection_date']])
+                    kline_conditions.append("(code = ? AND date = ?)")
+                if kline_conditions:
+                    kline_sql = f"""
+                    SELECT code, date, open, close FROM stock_kline 
+                    WHERE {' OR '.join(kline_conditions)}
+                    """
+                    kline_cursor = self.db_manager.execute_with_retry(kline_sql, kline_params)
+                    for krow in kline_cursor.fetchall():
+                        kcode = krow[0]
+                        kdate = krow[1]
+                        kopen = krow[2]
+                        kclose = krow[3]
+                        if kopen and kopen > 0 and kclose:
+                            daily_change_map[(kcode, kdate)] = round(((kclose - kopen) / kopen) * 100, 2)
+            except Exception as ke:
+                logger.warning(f"批量查询选股日涨跌幅失败: {ke}")
             
             # 第三步：批量获取所有股票的实时数据（一次HTTP请求）
             stock_codes = list(set(r['stock_code'] for r in candidate_list))
@@ -670,30 +702,44 @@ class SelectionRecordManager:
                 record['price_diff'] = round(cp - sp, 2)
                 record['price_diff_pct'] = round(((cp - sp) / sp) * 100, 2) if sp != 0 else 0.0
                 
+                # 当日涨跌幅
+                record['daily_change_pct'] = daily_change_map.get((stock_code, selection_date), None)
+                
                 data.append(record)
                 filtered_total += 1
             
             # 按百分比价差降序排序（默认）
             data.sort(key=lambda x: x.get('price_diff_pct', 0), reverse=True)
             
+            # 筛选后的实际总数（策略筛选后 data 已经是最终结果）
+            total = len(data)
+            
+            # 计算统计数据
+            positive_count = sum(1 for r in data if r.get('price_diff_pct', 0) > 0)
+            negative_count = sum(1 for r in data if r.get('price_diff_pct', 0) < 0)
+            zero_count = total - positive_count - negative_count
+            win_rate = round(positive_count / total * 100, 1) if total > 0 else 0
+            
+            # 计算策略分组胜率排名（基于全量去重后数据）
+            strategy_groups = self._calc_strategy_groups(data)
+            
             # 分页截取
             start_idx = (page - 1) * limit
-            data = data[start_idx:start_idx + limit]
+            paginated_data = data[start_idx:start_idx + limit]
             
-            # 重新计算筛选后的总数
-            if strategy_name_filter:
-                filtered_total = len([r for r in candidate_list 
-                    if self._match_strategy_filter(r['stock_code'], r['selection_date'], strategy_name_filter)])
-                total = filtered_total
-            
-            logger.info(f"查询选股历史 - 总数: {total}, 筛选后: {len(data)}, 页码: {page}, 每页: {limit}")
+            logger.info(f"查询选股历史 - 总数: {total}, 正收益: {positive_count}, 负收益: {negative_count}, 胜率: {win_rate}%, 策略组: {len(strategy_groups)}")
             
             return {
                 'success': True,
                 'total': total,
                 'page': page,
                 'limit': limit,
-                'data': data
+                'data': paginated_data,
+                'positive_count': positive_count,
+                'negative_count': negative_count,
+                'zero_count': zero_count,
+                'win_rate': win_rate,
+                'strategy_groups': strategy_groups
             }
         
         except Exception as e:
@@ -702,6 +748,56 @@ class SelectionRecordManager:
                 'success': False,
                 'error': str(e)
             }
+    
+    def _calc_strategy_groups(self, data: List[Dict]) -> List[Dict]:
+        """
+        计算策略分组胜率排名
+        
+        按选股方案分组，每组内按 stock_code 去重（保留最新），
+        统计正/负收益和胜率，按胜率降序排列。
+        """
+        # 按 strategy_name 分组
+        groups = {}
+        for record in data:
+            strategy_name = record.get('strategy_name', '')
+            if not strategy_name:
+                continue
+            # 一个股票可能有多个策略，用中文逗号分隔，逐个拆分
+            for name in strategy_name.split('，'):
+                name = name.strip()
+                if not name:
+                    continue
+                if name not in groups:
+                    groups[name] = []
+                groups[name].append(record)
+        
+        # 每组内按 stock_code 去重（数据已按 selection_date DESC 排序，第一条就是最新的）
+        result = []
+        for name, records in groups.items():
+            seen_codes = set()
+            unique_records = []
+            for r in records:
+                code = r.get('stock_code', '')
+                if code and code not in seen_codes:
+                    seen_codes.add(code)
+                    unique_records.append(r)
+            
+            total = len(unique_records)
+            positive = sum(1 for r in unique_records if r.get('price_diff_pct', 0) > 0)
+            negative = total - positive
+            win_rate = round(positive / total * 100, 1) if total > 0 else 0
+            
+            result.append({
+                'strategy_name': name,
+                'total': total,
+                'positive': positive,
+                'negative': negative,
+                'win_rate': win_rate
+            })
+        
+        # 按胜率降序排列
+        result.sort(key=lambda x: x['win_rate'], reverse=True)
+        return result
     
     def _match_strategy_filter(self, stock_code: str, selection_date, filter_text: str) -> bool:
         """检查股票是否匹配策略名称筛选"""

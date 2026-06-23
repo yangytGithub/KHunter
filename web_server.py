@@ -1931,6 +1931,8 @@ def get_selection_history():
         start_date = request.args.get('start_date', '')
         end_date = request.args.get('end_date', '')
         stock_code = request.args.get('stock_code', '')
+        exclude_chinext = request.args.get('exclude_chinext', '') == '1'
+        exclude_star = request.args.get('exclude_star', '') == '1'
         page = int(request.args.get('page', 1))
         limit = int(request.args.get('limit', 20))
         
@@ -1944,6 +1946,10 @@ def get_selection_history():
             filters['end_date'] = end_date
         if stock_code:
             filters['stock_code'] = stock_code
+        if exclude_chinext:
+            filters['exclude_chinext'] = True
+        if exclude_star:
+            filters['exclude_star'] = True
         
         # 查询选股历史
         result = selection_record_manager.get_selection_history(

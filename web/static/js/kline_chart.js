@@ -197,8 +197,10 @@ function drawKlineChart(ctx, canvas, formattedData, rawData) {
     const chartWidth = width - padding * 2;
     
     // 为成交量图表留出空间，K线图占65%，成交量图占35%
-    const klineHeight = (height - padding * 2) * 0.65;
-    const volumeHeight = (height - padding * 2) * 0.35;
+    // 底部增加额外空间用于斜体日期标签
+    const bottomExtra = 40;
+    const klineHeight = (height - padding * 2 - bottomExtra) * 0.65;
+    const volumeHeight = (height - padding * 2 - bottomExtra) * 0.35;
     const volumeStartY = padding + klineHeight;
     
     // 清空画布
@@ -245,41 +247,49 @@ function drawKlineChart(ctx, canvas, formattedData, rawData) {
         ctx.fillText(price.toFixed(2), padding - 15, y + 4);
     }
     
-    // 绘制竖直网格线和日期标签
-    const gridLines = Math.min(10, Math.floor(formattedData.candleData.length / 5));
-    for (let i = 0; i <= gridLines; i++) {
-        const x = padding + (chartWidth / gridLines) * i;
+    // 绘制竖直网格线和日期标签 - 基于K线位置确保对齐
+    const totalCandles = formattedData.candleData.length;
+    // 计算每个日期标签需要的最小间距（基于斜体文字宽度）
+    // 日期字符串如 "2026-01-19" 约80px宽，旋转45度后水平投影约56px
+    const minSpacing = 60;
+    const labelInterval = Math.max(1, Math.ceil(minSpacing / candleSpacing));
+    
+    // 只在间隔位置绘制网格线和日期标签
+    for (let i = 0; i < totalCandles; i += labelInterval) {
+        const x = padding + i * candleSpacing + candleSpacing / 2;
+        
+        // 绘制竖直网格线（虚线效果）
+        ctx.strokeStyle = '#e5e7eb';
+        ctx.lineWidth = 0.5;
+        ctx.setLineDash([3, 3]);
         ctx.beginPath();
         ctx.moveTo(x, padding);
-        ctx.lineTo(x, height - padding);
+        ctx.lineTo(x, padding + klineHeight + volumeHeight);
         ctx.stroke();
+        ctx.setLineDash([]);
         
-        // 绘制日期标签 - 使用formattedData.candleData中的数据
-        const dataIndex = Math.floor((formattedData.candleData.length - 1) * (i / gridLines));
-        if (dataIndex >= 0 && dataIndex < formattedData.candleData.length) {
-            // 从formattedData中获取日期，而不是rawData
-            // formattedData.candleData已经是正确顺序的（从早到晚）
-            const candle = formattedData.candleData[dataIndex];
+        // 绘制日期标签（斜体展示）
+        const candle = formattedData.candleData[i];
+        let date = '';
+        for (let j = 0; j < rawData.length; j++) {
+            const rawDate = new Date(rawData[j].date);
+            const candleDate = new Date(candle.time * 1000);
             
-            // 从rawData中查找对应的日期
-            let date = '';
-            for (let j = 0; j < rawData.length; j++) {
-                const rawDate = new Date(rawData[j].date);
-                const candleDate = new Date(candle.time * 1000);
-                
-                // 比较日期是否相同
-                if (rawDate.toDateString() === candleDate.toDateString()) {
-                    date = rawData[j].date;
-                    break;
-                }
+            if (rawDate.toDateString() === candleDate.toDateString()) {
+                date = rawData[j].date;
+                break;
             }
-            
-            if (date) {
-                ctx.fillStyle = '#666';
-                ctx.font = '11px -apple-system, BlinkMacSystemFont, "Segoe UI", Arial, sans-serif';
-                ctx.textAlign = 'center';
-                ctx.fillText(date, x, height - padding + 20);
-            }
+        }
+        
+        if (date) {
+            ctx.fillStyle = '#666';
+            ctx.font = '11px -apple-system, BlinkMacSystemFont, "Segoe UI", Arial, sans-serif';
+            ctx.textAlign = 'right';
+            ctx.save();
+            ctx.translate(x, padding + klineHeight + volumeHeight + 15);
+            ctx.rotate(-Math.PI / 4); // 逆时针旋转45度
+            ctx.fillText(date, 0, 0);
+            ctx.restore();
         }
     }
     
@@ -323,12 +333,13 @@ function drawKlineChart(ctx, canvas, formattedData, rawData) {
     drawVolumeChart(ctx, formattedData, padding, volumeStartY, volumeHeight, candleWidth, candleSpacing);
     
     // 绘制坐标轴
+    const chartBottom = padding + klineHeight + volumeHeight;
     ctx.strokeStyle = '#333';
     ctx.lineWidth = 1.5;
     ctx.beginPath();
     ctx.moveTo(padding, padding);
-    ctx.lineTo(padding, height - padding);
-    ctx.lineTo(width - padding, height - padding);
+    ctx.lineTo(padding, chartBottom);
+    ctx.lineTo(width - padding, chartBottom);
     ctx.stroke();
     
     // 绘制K线图和成交量图的分隔线
@@ -360,7 +371,7 @@ function drawKlineChart(ctx, canvas, formattedData, rawData) {
     ctx.fillStyle = '#666';
     ctx.font = 'bold 12px -apple-system, BlinkMacSystemFont, "Segoe UI", Arial, sans-serif';
     ctx.textAlign = 'center';
-    ctx.fillText('交易日期', width / 2, height - 10);
+    ctx.fillText('交易日期', width / 2, chartBottom + 60);
     
     // 绘制标题
     ctx.fillStyle = '#1f2937';

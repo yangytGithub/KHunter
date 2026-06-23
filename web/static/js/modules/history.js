@@ -8,21 +8,19 @@
 export function searchSelectionHistory() {
     console.log('开始查询选股历史...');
     
-    // 获取筛选条件
     const strategyFilter = document.getElementById('history-strategy-filter');
     const startDateInput = document.getElementById('history-start-date');
     const endDateInput = document.getElementById('history-end-date');
-    
-    console.log('筛选元素:', { strategyFilter, startDateInput, endDateInput });
+    const excludeChinext = document.getElementById('history-exclude-chinext');
+    const excludeStar = document.getElementById('history-exclude-star');
     
     const strategyName = strategyFilter?.value?.trim() || '';
     const startDate = startDateInput?.value || '';
     const endDate = endDateInput?.value || '';
+    const excludeChinextVal = excludeChinext?.checked ? '1' : '0';
+    const excludeStarVal = excludeStar?.checked ? '1' : '0';
     
-    console.log('筛选条件:', { strategyName, startDate, endDate });
-    
-    // 调用API（不传递股票代码）
-    fetchSelectionHistory(strategyName, startDate, endDate, 1);
+    fetchSelectionHistory(strategyName, startDate, endDate, 1, excludeChinextVal, excludeStarVal);
 }
 
 /**
@@ -32,12 +30,13 @@ export function searchSelectionHistory() {
  * @param {string} endDate - 结束日期
  * @param {number} page - 页码
  */
-export function fetchSelectionHistory(strategyName, startDate, endDate, page) {
-    // 构建查询参数
+export function fetchSelectionHistory(strategyName, startDate, endDate, page, excludeChinext, excludeStar) {
     const params = new URLSearchParams();
     if (strategyName) params.append('strategy_name', strategyName);
     if (startDate) params.append('start_date', startDate);
     if (endDate) params.append('end_date', endDate);
+    if (excludeChinext === '1') params.append('exclude_chinext', '1');
+    if (excludeStar === '1') params.append('exclude_star', '1');
     params.append('page', page);
     params.append('limit', 20);
     
@@ -54,7 +53,8 @@ export function fetchSelectionHistory(strategyName, startDate, endDate, page) {
             console.log('API返回数据:', data);
             if (data.success) {
                 renderHistoryTable(data.data);
-                updateHistoryStats(data.total, data.page, data.limit);
+                updateHistoryStats(data);
+                renderStrategyRanking(data.strategy_groups || []);
                 renderHistoryPagination(data.total, data.page, data.limit);
             } else {
                 showHistoryError(data.error || '查询失败');
@@ -106,7 +106,7 @@ export function renderHistoryTable(data) {
         const selectionPrice = record.selection_day_price || record.selection_price || 0;
         const priceDiff = record.price_diff || 0;
         const priceDiffPct = record.price_diff_pct || 0;
-        const diffColor = priceDiff > 0 ? '#16a34a' : priceDiff < 0 ? '#dc2626' : '#6b7280';
+        const diffColor = priceDiff > 0 ? '#dc2626' : priceDiff < 0 ? '#16a34a' : '#6b7280';
         const diffSign = priceDiff > 0 ? '+' : '';
         const pctSign = priceDiffPct > 0 ? '+' : '';
         row.innerHTML = `
@@ -118,6 +118,7 @@ export function renderHistoryTable(data) {
             <td>¥${formatPrice(record.current_price)}</td>
             <td style="color: ${diffColor}; font-weight: 600;">${diffSign}¥${formatPrice(priceDiff)}</td>
             <td style="color: ${diffColor}; font-weight: 600;">${pctSign}${formatPrice(priceDiffPct)}%</td>
+            <td>${formatDailyChange(record.daily_change_pct)}</td>
             <td>
                 <div style="font-size: 12px;">
                     <div>最高: ¥${formatPrice(record.highest_price)}</div>
@@ -130,27 +131,68 @@ export function renderHistoryTable(data) {
 }
 
 /**
- * 更新统计信息
- * @param {number} total - 总数
- * @param {number} page - 当前页码
- * @param {number} limit - 每页数量
+ * 渲染策略分组胜率排名
+ * @param {Array} groups - 策略分组数据
  */
-export function updateHistoryStats(total, page, limit) {
+export function renderStrategyRanking(groups) {
+    const container = document.getElementById('history-strategy-ranking');
+    const tbody = document.getElementById('history-strategy-ranking-tbody');
+    
+    if (!container || !tbody) return;
+    
+    if (!groups || groups.length === 0) {
+        container.style.display = 'none';
+        return;
+    }
+    
+    container.style.display = 'block';
+    tbody.innerHTML = '';
+    
+    groups.forEach((group, index) => {
+        const wr = group.win_rate || 0;
+        const wrColor = wr >= 50 ? '#dc2626' : wr >= 30 ? '#eab308' : '#16a34a';
+        
+        const row = document.createElement('tr');
+        row.innerHTML = `
+            <td style="text-align: center; font-weight: 600;">${index + 1}</td>
+            <td><span style="background: #dbeafe; color: #0c4a6e; padding: 2px 6px; border-radius: 3px; font-size: 12px;">${escapeHtml(group.strategy_name)}</span></td>
+            <td style="text-align: center;">${group.total}</td>
+            <td style="text-align: center; color: #dc2626; font-weight: 600;">${group.positive}</td>
+            <td style="text-align: center; color: #16a34a; font-weight: 600;">${group.negative}</td>
+            <td style="text-align: center; color: ${wrColor}; font-weight: 600;">${wr}%</td>
+        `;
+        tbody.appendChild(row);
+    });
+}
+
+/**
+ * 更新统计信息
+ * @param {Object} apiData - API返回的完整数据对象
+ */
+export function updateHistoryStats(apiData) {
     const statsDiv = document.getElementById('history-stats');
     const totalElem = document.getElementById('history-total');
+    const positiveElem = document.getElementById('history-positive');
+    const negativeElem = document.getElementById('history-negative');
+    const winrateElem = document.getElementById('history-winrate');
     const pageElem = document.getElementById('history-current-page');
     const totalPagesElem = document.getElementById('history-total-pages');
     
-    // 检查元素是否存在
     if (!statsDiv || !totalElem || !pageElem) {
         console.error('统计信息元素不存在');
         return;
     }
     
+    const total = apiData.total || 0;
+    const page = apiData.page || 1;
+    const limit = apiData.limit || 20;
     const totalPages = Math.ceil(total / limit);
     
     totalElem.textContent = total;
     pageElem.textContent = page;
+    if (positiveElem) positiveElem.textContent = apiData.positive_count || 0;
+    if (negativeElem) negativeElem.textContent = apiData.negative_count || 0;
+    if (winrateElem) winrateElem.textContent = (apiData.win_rate || 0) + '%';
     if (totalPagesElem) {
         totalPagesElem.textContent = totalPages;
     }
@@ -209,8 +251,10 @@ export function goToHistoryPage(page) {
     const strategyName = document.getElementById('history-strategy-filter')?.value.trim() || '';
     const startDate = document.getElementById('history-start-date')?.value || '';
     const endDate = document.getElementById('history-end-date')?.value || '';
+    const excludeChinext = document.getElementById('history-exclude-chinext')?.checked ? '1' : '0';
+    const excludeStar = document.getElementById('history-exclude-star')?.checked ? '1' : '0';
     
-    fetchSelectionHistory(strategyName, startDate, endDate, page);
+    fetchSelectionHistory(strategyName, startDate, endDate, page, excludeChinext, excludeStar);
 }
 
 /**
@@ -220,13 +264,15 @@ export function resetHistoryFilters() {
     const strategyFilter = document.getElementById('history-strategy-filter');
     const startDate = document.getElementById('history-start-date');
     const endDate = document.getElementById('history-end-date');
+    const excludeChinext = document.getElementById('history-exclude-chinext');
+    const excludeStar = document.getElementById('history-exclude-star');
     
-    // 检查元素是否存在
     if (strategyFilter) strategyFilter.value = '';
     if (startDate) startDate.value = '';
     if (endDate) endDate.value = '';
+    if (excludeChinext) excludeChinext.checked = false;
+    if (excludeStar) excludeStar.checked = false;
     
-    // 重置后显示空状态，不自动查询
     showHistoryEmptyState('请点击"查询"按钮加载数据');
 }
 
@@ -283,6 +329,18 @@ export function formatDate(dateStr) {
 export function formatPrice(price) {
     if (price == null || isNaN(price)) return '--';
     return price.toFixed(2);
+}
+
+/**
+ * 格式化当日涨跌幅
+ * @param {number|null} pct - 涨跌百分比
+ * @returns {string} 格式化后的HTML
+ */
+export function formatDailyChange(pct) {
+    if (pct == null || isNaN(pct)) return '<span style="color: #9ca3af;">--</span>';
+    const color = pct > 0 ? '#dc2626' : pct < 0 ? '#16a34a' : '#6b7280';
+    const sign = pct > 0 ? '+' : '';
+    return `<span style="color: ${color}; font-weight: 600;">${sign}${pct.toFixed(2)}%</span>`;
 }
 
 /**
